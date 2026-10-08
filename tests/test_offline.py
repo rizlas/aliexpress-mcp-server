@@ -203,3 +203,10 @@ def test_variants_rendered(monkeypatch):
     assert "Unavailable: Color: 100W Metal Blue / Length: 0.5m" in out and "149,799" not in out
     out = m.get_product_details(item_id="1", variant="GREY 1m")
     assert "1 available of 1 matching" in out and "0.5m" not in out
+
+def test_free_shipping_flag():
+    resp = {"data": {"result": {"PRODUCT_TITLE": {"text": "x"}, "SHIPPING": {"originalLayoutResultList": [
+        {"bizData": {"shippingFee": "free", "discount": 100.0, "shipFrom": "Germany",
+                     "displayEtaMinDate": "11 ott", "displayEtaMaxDate": "16 ott"}}]}}}}
+    d = m._extract_pdp_fields(resp, "1")
+    assert d["shipping_cost"] == 0.0 and d["ship_from"] == "Germany"

@@ -1138,6 +1138,10 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                     d["shipping_cost"] = float(amt)
                 except (TypeError, ValueError):
                     d["shipping_cost"] = parse_price(str(amt))
+            # Free shipping comes without displayAmount, flagged as shippingFee: "free"
+            # (seen live Oct 2026, IT/EUR)
+            if d["shipping_cost"] is None and str(biz.get("shippingFee", "")).lower() == "free":
+                d["shipping_cost"] = 0.0
             if d["shipping_cost"] is None and biz.get("logisticsComposeThreshold"):
                 # e.g., "C$0.00" — sometimes the "threshold" is actually the freight text
                 d["shipping_cost"] = parse_price(biz["logisticsComposeThreshold"])

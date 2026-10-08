@@ -2,7 +2,12 @@
 
 An MCP server that lets Claude (or any MCP client) search AliExpress, read product details, check shipping, and look at your cart.
 
-**This fork** of [justinritchie/aliexpress-mcp-server](https://github.com/justinritchie/aliexpress-mcp-server) defaults to shipping to **Israel** with prices in **USD**. You can change both ([Configuration](#configuration)). Otherwise it tracks upstream.
+**This fork** of
+[justinritchie/aliexpress-mcp-server](https://github.com/justinritchie/aliexpress-mcp-server),
+built on [ohadle's fork](https://github.com/ohadle/aliexpress-mcp-server), defaults to
+shipping to **Italy** with prices in **EUR** and text in Italian, and also parses
+European number formats (`1.234,56 €`). You can change all three
+([Configuration](#configuration)). Otherwise it tracks upstream.
 
 It is read-only by design. It does **not** add to cart, check out, or pay.
 
@@ -11,14 +16,16 @@ It is read-only by design. It does **not** add to cart, check out, or pay.
 | Tool | Needs login? | What it does |
 |------|--------------|--------------|
 | `search_products(query, min_rating, max_price, sort_by)` | No | Search AliExpress. Sort by `best_match`, `orders`, `price_asc` or `price_desc`, and filter by rating or price. Prices are for the cheapest variant. |
-| `get_product_details(item_id or url, variant)` | No | Title, price and discount, rating, sold count, seller, shipping cost and delivery estimate, plus every variant (color, size, etc.) with its own price, cheapest first. `variant` filters the variants by name, e.g. `"black 2m"`. |
-| `get_shipping_estimate(item_id)` | No | Shipping cost and delivery estimate to your country. |
+| `get_product_details(item_id or url, variant)` | No, but see [Known limitations](#known-limitations) | Title, price and discount, rating, sold count, seller, shipping cost and delivery estimate, plus every variant (color, size, etc.) with its own price, cheapest first. `variant` filters the variants by name, e.g. `"black 2m"`. |
+| `get_shipping_estimate(item_id)` | No, but see [Known limitations](#known-limitations) | Shipping cost and delivery estimate to your country. |
 | `view_cart()` | **Yes** | What's in your AliExpress cart. Needs the Chrome extension ([Cart access](#cart-access-optional-chrome-extension)). |
 
 Example prompts:
 
-- "Find a USB-C cable on AliExpress with at least 4.7 stars, under $5, sorted by orders."
-- "What does shipping to Israel cost for https://www.aliexpress.com/item/1005007655628250.html?"
+- "Find a USB-C cable on AliExpress with at least 4.7 stars, under 5 €, sorted by
+  orders."
+- "What does shipping to Italy cost for
+  https://www.aliexpress.com/item/1005007655628250.html?"
 - "What's in my AliExpress cart, and what's the total?"
 
 ## Setup
@@ -28,7 +35,7 @@ You need **Python 3.10+** and `git`.
 ### 1. Download and install
 
 ```bash
-git clone https://github.com/ohadle/aliexpress-mcp-server.git
+git clone https://github.com/rizlas/aliexpress-mcp-server.git
 cd aliexpress-mcp-server
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -40,7 +47,9 @@ python3 -m venv .venv
 .venv/bin/python smoke_test.py
 ```
 
-This runs a real search, product lookup and shipping check (about 5 requests to aliexpress.com). You should see results with USD prices and shipping to IL.
+This runs a real search, product lookup and shipping check (about 5 requests to
+aliexpress.com). You should see results with EUR prices and shipping to IT. If the
+product lookup reports a captcha, see [Known limitations](#known-limitations).
 
 ### 3. Connect it to Claude
 
@@ -123,9 +132,9 @@ All settings are optional environment variables. In Claude Desktop, add them und
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `ALIEXPRESS_COUNTRY` | `IL` | Ship-to country, as a two-letter code (`US`, `GB`, `DE`, `CA`, …). |
-| `ALIEXPRESS_CURRENCY` | `USD` | Display currency (`EUR`, `GBP`, `ILS`, …). |
-| `ALIEXPRESS_LOCALE` | `en_US` | Language of titles and text. |
+| `ALIEXPRESS_COUNTRY` | `IT` | Ship-to country, as a two-letter code (`US`, `GB`, `DE`, `CA`, …). |
+| `ALIEXPRESS_CURRENCY` | `EUR` | Display currency (`USD`, `GBP`, `ILS`, …). |
+| `ALIEXPRESS_LOCALE` | `it_IT` | Language of titles and text (`en_US` for the original English titles). |
 | `ALIEXPRESS_CREDENTIALS` | `~/.mcp-credentials/aliexpress.json` | Where the Chrome extension's session file is. |
 
 For example, to ship to Germany with prices in euros:
@@ -159,6 +168,11 @@ Search still uses the simpler HTML path — no signed calls needed. `window.runP
 
 ## Known limitations
 
+- **Captcha on product details and shipping.** Without browser cookies, depending on
+  your IP, the MTOP API may answer with an anti-bot captcha (`FAIL_SYS_USER_VALIDATE` /
+  `RGV587_ERROR`) instead of product data. Search is not affected. The tools say so
+  explicitly; saving a session with the MCP Auth Bridge extension ([Save your
+  session](#save-your-session)) usually fixes it.
 - **Low-volume / brand-new listings** sometimes return empty MTOP responses (endpoint returns `SUCCESS` but an empty data block). Likely a region/visibility gate. Search results still show the listing fine.
 - **Cookies expire / lag the cart.** When tool calls start returning "session expired" — or `view_cart` reports an empty cart despite having items — re-open aliexpress.com in Chrome and click **Save AliExpress** again to capture fresh session cookies. The `_m_h5_tk` token and cart state rotate together; stale cookies show an empty server-side cart.
 - **Rate limiting** is the user's responsibility. The server sends realistic Chrome headers but doesn't throttle; don't hammer the search.

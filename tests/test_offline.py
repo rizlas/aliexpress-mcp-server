@@ -10,9 +10,37 @@ def _region(monkeypatch):
 @pytest.mark.parametrize("txt,val", [
     ("US $12.34", 12.34), ("$1,234.50", 1234.50), ("₪45.90", 45.90),
     ("45.90 ILS", 45.90), ("C$9.76", 9.76), ("€3.20", 3.20), ("Free", None),
+    # it_IT / European formats
+    ("1,99 €", 1.99), ("Risparmio 0,15€", 0.15), ("€ 1,99", 1.99), ("EUR 12,50", 12.50),
+    ("1.234,56 €", 1234.56), ("1.000 €", 1000.0), ("149.799,85€", 149799.85),
 ])
 def test_parse_price(txt, val):
     assert m.parse_price(txt) == val
+
+@pytest.mark.parametrize("txt,sold", [
+    ("5,000+ sold", "5,000+ sold"), ("50.000+ venduto(i)", "50.000+ venduto(i)"),
+    ("Oltre 100mila venduto(i)", "Oltre 100mila venduto(i)"), ("4.9 stelle", None),
+    ("Questo venditore: 1.000+ vendite | Vendite totali: Oltre 100mila", "1.000+ vendite"),
+])
+def test_sold_re(txt, sold):
+    mt = m.SOLD_RE.search(txt)
+    assert (mt.group(0) if mt else None) == sold
+
+def test_accept_language():
+    assert m._accept_language("it_IT") == "it-IT,it;q=0.9,en;q=0.8"
+    assert m._accept_language("en_US") == "en-US,en;q=0.9"
+
+def test_captcha_reply_is_reported(monkeypatch):
+    # Captured live (Oct 2026): anonymous MTOP calls from some IPs get a "punish" page.
+    punish = {"ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试"],
+              "data": {"url": "https://acs.aliexpress.com/.../_____tmd_____/punish?x5step=2",
+                       "dialogSize": {"width": "420px", "height": "480px"}}}
+    calls = []
+    monkeypatch.setattr(m, "mtop_call", lambda *a, **k: calls.append(a) or punish)
+    monkeypatch.setattr(m, "_TRANSPORT", httpx.MockTransport(lambda req: httpx.Response(200, text="<html></html>")))
+    assert m.MTOP_BLOCKED_MSG in m.get_product_details(item_id="1")
+    assert m.MTOP_BLOCKED_MSG in m.get_shipping_estimate("1")
+    assert len(calls) == 2  # one MTOP endpoint per tool call, no pointless fallbacks
 
 def test_sign_matches_mtop_js():
     raw = "tok&1700000000000&12574478&{\"a\":1}"

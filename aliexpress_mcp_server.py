@@ -3,11 +3,13 @@
 AliExpress MCP Server
 
 Search AliExpress, pull clean product details, check shipping to the
-configured country (default: Israel, prices in USD), and peek at the cart — all read-only.
+configured country (default: Italy, prices in EUR), and peek at the cart — all read-only.
 
-Adapted from justinritchie/aliexpress-mcp-server: IL/USD defaults,
-currency-agnostic price parsing, explicit region cookie, and anonymous
-MTOP token bootstrap so search/details/shipping work without a login.
+Adapted from justinritchie/aliexpress-mcp-server via ohadle's fork:
+currency-agnostic price parsing (en_US and European number formats),
+explicit region cookie, and anonymous MTOP token bootstrap so
+search/details/shipping can work without a login. This fork defaults to
+IT/EUR/it_IT.
 
 Auth: Session cookies from MCP Auth Bridge extension at
 ~/.mcp-credentials/aliexpress.json
@@ -33,9 +35,21 @@ CREDENTIALS_PATH = Path(
     os.environ.get("ALIEXPRESS_CREDENTIALS", "~/.mcp-credentials/aliexpress.json")
 ).expanduser()
 
-COUNTRY = os.environ.get("ALIEXPRESS_COUNTRY", "IL")
-CURRENCY = os.environ.get("ALIEXPRESS_CURRENCY", "USD")
-LOCALE = os.environ.get("ALIEXPRESS_LOCALE", "en_US")
+COUNTRY = os.environ.get("ALIEXPRESS_COUNTRY", "IT")
+CURRENCY = os.environ.get("ALIEXPRESS_CURRENCY", "EUR")
+LOCALE = os.environ.get("ALIEXPRESS_LOCALE", "it_IT")
+
+
+def _accept_language(locale: str) -> str:
+    """it_IT -> "it-IT,it;q=0.9,en;q=0.8"; en_US -> "en-US,en;q=0.9"."""
+    lang = locale.split("_", 1)[0]
+    tag = locale.replace("_", "-")
+    if lang == "en":
+        return f"{tag},en;q=0.9"
+    return f"{tag},{lang};q=0.9,en;q=0.8"
+
+
+ACCEPT_LANGUAGE = _accept_language(LOCALE)
 
 # Optional: inject an httpx transport (used by offline tests).
 _TRANSPORT: Optional[httpx.BaseTransport] = None
@@ -94,7 +108,7 @@ def get_client(require_auth: bool = False, referer: str = BASE_URL) -> httpx.Cli
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": ACCEPT_LANGUAGE,
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": referer,
         "Upgrade-Insecure-Requests": "1",
@@ -212,7 +226,7 @@ def mtop_call(
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": ACCEPT_LANGUAGE,
         "Referer": referer or f"{BASE_URL}/",
         "Origin": BASE_URL,
         "Cookie": cookie_str,
@@ -278,16 +292,43 @@ def _walk_find(obj: Any, match_keys: set) -> Any:
 # ─── Parsing Helpers ────────────────────────────────────────────────────────
 
 CURRENCY_TOKENS = r"(?:₪|ILS|NIS|C\$|CA\$|US\$|A\$|\$|€|EUR|£|GBP|CAD|USD)"
-# Symbol before ("₪12.34", "US $5") or after ("12.34₪", "1,234.50 ILS").
-# Assumes en_US number format (comma = thousands separator).
-PRICE_RE = re.compile(CURRENCY_TOKENS + r"\s*([\d,]+(?:\.\d{1,2})?)")
-PRICE_AFTER_RE = re.compile(r"([\d,]+(?:\.\d{1,2})?)\s*" + CURRENCY_TOKENS)
-ANY_PRICE_RE = re.compile(r"(?:" + CURRENCY_TOKENS + r"\s*)?[\d,]+\.\d{2}(?:\s*" + CURRENCY_TOKENS + r")?")
+# Symbol before ("₪12.34", "US $5") or after ("12.34₪", "1,99 €").
+# Numbers may be en_US ("1,234.50") or European ("1.234,50"); see _to_float.
+PRICE_RE = re.compile(CURRENCY_TOKENS + r"\s*(\d[\d.,]*)")
+PRICE_AFTER_RE = re.compile(r"(\d[\d.,]*)\s*" + CURRENCY_TOKENS)
+ANY_PRICE_RE = re.compile(r"(?:" + CURRENCY_TOKENS + r"\s*)?\d[\d.,]*[.,]\d{2}(?:\s*" + CURRENCY_TOKENS + r")?")
+# "5,000+ sold", "50.000+ venduto(i)", "Oltre 100mila venduto(i)", "1.000+ vendite"
+SOLD_RE = re.compile(r"(?:Oltre\s+)?[\d.,]+(?:mila)?\+?\s*(?:sold|vendut[oi](?:\(i\))?|vendite)", re.IGNORECASE)
+# Search card tags that only repeat the discount ("Save US $0.42", "Risparmio 0,15€")
+SAVINGS_TAG_PREFIXES = ("save ", "risparmio")
 
 
 def fmt_money(v: Optional[float], currency: Optional[str] = None) -> str:
     return f"{v:,.2f} {currency or CURRENCY}" if v is not None else "?"
 ITEM_ID_RE = re.compile(r"/item/(\d+)\.html")
+
+
+def _to_float(num: str) -> Optional[float]:
+    """
+    Parse "1,234.56", "1.234,56", "1,99", "1.000" and friends. With both
+    separators the last one is the decimal point; a lone separator is a
+    thousands separator if repeated or followed by exactly three digits.
+    """
+    num = num.strip(".,")
+    seps = {c for c in num if c in ".,"}
+    if len(seps) == 2:
+        dec = num[max(num.rfind("."), num.rfind(","))]
+        num = num.replace("," if dec == "." else ".", "").replace(dec, ".")
+    elif seps:
+        sep = seps.pop()
+        if num.count(sep) > 1 or len(num) - num.rfind(sep) - 1 == 3:
+            num = num.replace(sep, "")
+        else:
+            num = num.replace(sep, ".")
+    try:
+        return float(num)
+    except ValueError:
+        return None
 
 
 def parse_price(text: str) -> Optional[float]:
@@ -296,17 +337,11 @@ def parse_price(text: str) -> Optional[float]:
         return None
     m = PRICE_RE.search(text) or PRICE_AFTER_RE.search(text)
     if m:
-        try:
-            return float(m.group(1).replace(",", ""))
-        except ValueError:
-            return None
+        return _to_float(m.group(1))
     # Fallback: bare number
-    m = re.search(r"([\d,]+\.\d{2})", text)
+    m = re.search(r"(\d[\d.,]*[.,]\d{2})", text)
     if m:
-        try:
-            return float(m.group(1).replace(",", ""))
-        except ValueError:
-            return None
+        return _to_float(m.group(1))
     return None
 
 
@@ -532,7 +567,7 @@ def parse_search_results(html: str) -> list[dict]:
         if dm:
             discount_pct = int(dm.group(1))
 
-        sold_match = re.search(r"([\d,]+\+?)\s*sold", card_text, re.IGNORECASE)
+        sold_match = SOLD_RE.search(card_text)
         sold_count = sold_match.group(0) if sold_match else None
 
         rating = None
@@ -665,7 +700,7 @@ def parse_product_detail(html: str, item_id: str) -> dict:
                 pass
 
     # Sold count
-    sold_match = re.search(r"([\d,]+\+?)\s*sold", body_text, re.IGNORECASE)
+    sold_match = SOLD_RE.search(body_text)
     if sold_match:
         details["sold_count"] = sold_match.group(0)
 
@@ -752,7 +787,7 @@ def search_products(
         query: Search term (e.g., "groudon plush", "usb c cable")
         min_rating: Minimum rating (0-5, e.g., 4.5). 0 disables filter.
             Unrated listings are excluded when this is set.
-        max_price: Maximum price in the configured currency (default USD). 0 disables filter.
+        max_price: Maximum price in the configured currency (default EUR). 0 disables filter.
         sort_by: One of "best_match", "orders", "price_asc", "price_desc"
             (all four verified live).
     """
@@ -810,7 +845,7 @@ def search_products(
                 line += f" ★{p['rating']}"
             if p["sold_count"]:
                 line += f" · {p['sold_count']}"
-            useful = [t for t in p.get("tags", []) if not t.lower().startswith("save ")]
+            useful = [t for t in p.get("tags", []) if not t.lower().startswith(SAVINGS_TAG_PREFIXES)]
             if useful:
                 line += f" · {'; '.join(useful[:2])}"
             line += f"\n  item_id: {p['item_id']}"
@@ -820,10 +855,18 @@ def search_products(
         client.close()
 
 
+MTOP_BLOCKED_MSG = (
+    "AliExpress's anti-bot check (captcha) blocked the product API. Search still "
+    "works. For details and shipping, save a browser session with the MCP Auth "
+    "Bridge extension (real browser cookies usually pass) or retry later."
+)
+
+
 def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
     """
     Call the PDP MTOP endpoint and return the raw response dict, or None on failure.
     Tries the PC endpoint first, then the msite endpoint as a fallback.
+    Raises RuntimeError(MTOP_BLOCKED_MSG) when AliExpress answers with a captcha.
     """
     referer = f"{BASE_URL}/item/{item_id}.html"
     payload = {
@@ -847,6 +890,10 @@ def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
             logger.debug("MTOP %s failed: %s", api, e)
             continue
         ret = resp.get("ret", [])
+        # Captcha ("punish") reply: data holds a challenge URL, not a product,
+        # and the other endpoints get the same treatment, so stop here.
+        if any("USER_VALIDATE" in r or "RGV587" in r for r in ret):
+            raise RuntimeError(MTOP_BLOCKED_MSG)
         if ret and any("SUCCESS" in r for r in ret):
             return resp
         # Some endpoints return data even without SUCCESS::API_SUCCESS in ret
@@ -1047,7 +1094,7 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
             except (TypeError, ValueError):
                 pass
         other = rating_mod.get("otherText") or ""
-        sm = re.search(r"([\d,]+\+?)\s*sold", other, re.IGNORECASE)
+        sm = SOLD_RE.search(other)
         if sm:
             d["sold_count"] = sm.group(0)
 
@@ -1146,12 +1193,14 @@ def get_product_details(item_id: str = "", url: str = "", variant: str = "") -> 
     # Login not required: mtop_call bootstraps an anonymous token if needed.
     # Primary path: MTOP signed API
     d: Optional[dict] = None
+    mtop_error: Optional[str] = None
     try:
         resp = _fetch_pdp_mtop(item_id)
         if resp:
             d = _extract_pdp_fields(resp, item_id)
     except Exception as e:
         logger.warning("MTOP PDP fetch failed: %s", e)
+        mtop_error = str(e)
 
     # Fallback: HTML scrape (rarely useful since PDP is CSR, but kept for robustness)
     if not d or not (d.get("title") or d.get("price")):
@@ -1174,6 +1223,8 @@ def get_product_details(item_id: str = "", url: str = "", variant: str = "") -> 
             client.close()
 
     if not d or not (d.get("title") or d.get("price")):
+        if mtop_error == MTOP_BLOCKED_MSG:
+            return f"Could not extract product data for item {item_id}. {MTOP_BLOCKED_MSG}"
         return (
             f"Could not extract product data for item {item_id}. "
             "The MTOP API returned no data — session may be expired or the item "
@@ -1267,7 +1318,7 @@ def _format_variants(variants: list[dict], query: str = "") -> list[str]:
 def get_shipping_estimate(item_id: str) -> str:
     """
     Check shipping time and cost for a product to the configured country
-    (default: Israel; set ALIEXPRESS_COUNTRY to change).
+    (default: Italy; set ALIEXPRESS_COUNTRY to change).
 
     Args:
         item_id: AliExpress item ID (e.g., "1005007655628250")

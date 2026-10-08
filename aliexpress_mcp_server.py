@@ -12,7 +12,8 @@ search/details/shipping can work without a login. This fork defaults to
 IT/EUR/it_IT.
 
 Auth: Session cookies from MCP Auth Bridge extension at
-~/.mcp-credentials/aliexpress.json
+~/.mcp-credentials/aliexpress.json, or read straight from a Firefox profile
+when ALIEXPRESS_FIREFOX_PROFILE is set.
 """
 
 import json
@@ -21,6 +22,10 @@ import re
 import time
 import hashlib
 import logging
+import shutil
+import sqlite3
+import tempfile
+import configparser
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote_plus, quote
@@ -34,6 +39,10 @@ from mcp.server.fastmcp import FastMCP
 CREDENTIALS_PATH = Path(
     os.environ.get("ALIEXPRESS_CREDENTIALS", "~/.mcp-credentials/aliexpress.json")
 ).expanduser()
+
+# Read session cookies straight from a Firefox profile instead of the
+# credentials file: "auto" (the profile the installed Firefox opens) or a path.
+FIREFOX_PROFILE = os.environ.get("ALIEXPRESS_FIREFOX_PROFILE", "")
 
 COUNTRY = os.environ.get("ALIEXPRESS_COUNTRY", "IT")
 CURRENCY = os.environ.get("ALIEXPRESS_CURRENCY", "EUR")
@@ -71,14 +80,95 @@ def _region_cookie() -> str:
     return f"site=glo&c_tp={CURRENCY}&region={COUNTRY}&b_locale={LOCALE}"
 
 
+FIREFOX_DIRS = [
+    Path("~/.mozilla/firefox").expanduser(),                              # Linux deb/tarball
+    Path("~/snap/firefox/common/.mozilla/firefox").expanduser(),          # Linux snap
+    Path("~/.var/app/org.mozilla.firefox/.mozilla/firefox").expanduser(), # Linux flatpak
+    Path("~/Library/Application Support/Firefox").expanduser(),           # macOS
+]
+# Cookie hosts a browser would send to www.aliexpress.com and acs.aliexpress.com.
+# Host-only cookies come last so they win over domain cookies with the same name.
+FIREFOX_COOKIE_HOSTS = (".aliexpress.com", "aliexpress.com", "www.aliexpress.com", "acs.aliexpress.com")
+
+
+def find_firefox_profile(setting: str) -> Optional[Path]:
+    """Resolve ALIEXPRESS_FIREFOX_PROFILE: a profile directory, or "auto"."""
+    if setting != "auto":
+        return Path(setting).expanduser()
+    for base in FIREFOX_DIRS:
+        ini = base / "profiles.ini"
+        if not ini.exists():
+            continue
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.read(ini)
+        # [Install…] Default= is the profile the installed Firefox opens;
+        # [Profile…] Default=1 is a legacy marker that may point elsewhere.
+        for sec in cp.sections():
+            if sec.startswith("Install") and cp.has_option(sec, "Default"):
+                return base / cp.get(sec, "Default")
+        for sec in cp.sections():
+            if sec.startswith("Profile") and cp.get(sec, "Default", fallback="") == "1":
+                path = cp.get(sec, "Path")
+                return base / path if cp.get(sec, "IsRelative", fallback="1") == "1" else Path(path)
+    return None
+
+
+def load_firefox_cookies(profile: Path) -> dict[str, str]:
+    """
+    Read the AliExpress cookies from a Firefox profile's cookies.sqlite.
+
+    Firefox keeps the database locked while it runs, so query a copy (plus its
+    WAL, which holds the latest writes) in a private temporary directory that
+    is deleted right after. Only the default container's cookies are used.
+    """
+    db = profile / "cookies.sqlite"
+    if not db.exists():
+        logger.warning("No cookies.sqlite in Firefox profile %s", profile)
+        return {}
+    hosts = ",".join("?" * len(FIREFOX_COOKIE_HOSTS))
+    with tempfile.TemporaryDirectory(prefix="aliexpress-mcp-") as td:
+        for suffix in ("", "-wal"):
+            src = db.with_name(db.name + suffix)
+            if src.exists():
+                shutil.copyfile(src, Path(td) / src.name)
+        con = sqlite3.connect(Path(td) / db.name)
+        try:
+            rows = con.execute(
+                "SELECT host, name, value, expiry FROM moz_cookies "
+                f"WHERE originAttributes = '' AND host IN ({hosts})",
+                FIREFOX_COOKIE_HOSTS,
+            ).fetchall()
+        finally:
+            con.close()
+
+    rank = {h: i for i, h in enumerate(FIREFOX_COOKIE_HOSTS)}
+    now_ms = time.time() * 1000
+    cookies: dict[str, str] = {}
+    for host, name, value, expiry in sorted(rows, key=lambda r: rank[r[0]]):
+        # expiry is in ms on recent Firefox versions, in seconds on older ones
+        if expiry and (expiry if expiry > 1e11 else expiry * 1000) < now_ms:
+            continue
+        cookies[name] = value
+    return cookies
+
+
 def load_cookies() -> dict[str, str]:
     """
-    Load session cookies (optional) from the MCP Auth Bridge credential file,
-    then force the region cookie so prices/shipping are for COUNTRY/CURRENCY
-    regardless of the account's or the IP's default.
+    Load session cookies (optional) from Firefox or from the MCP Auth Bridge
+    credential file, then force the region cookie so prices/shipping are for
+    COUNTRY/CURRENCY regardless of the account's or the IP's default.
     """
     cookies: dict[str, str] = {}
-    if CREDENTIALS_PATH.exists():
+    if FIREFOX_PROFILE:
+        profile = find_firefox_profile(FIREFOX_PROFILE)
+        if profile is None:
+            logger.warning("No Firefox profile found (ALIEXPRESS_FIREFOX_PROFILE=%s)", FIREFOX_PROFILE)
+        else:
+            try:
+                cookies = load_firefox_cookies(profile)
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Could not read Firefox cookies from %s: %s", profile, e)
+    elif CREDENTIALS_PATH.exists():
         try:
             data = json.loads(CREDENTIALS_PATH.read_text())
             cookies = dict(data.get("cookies", {}) or {})
@@ -98,10 +188,7 @@ def get_client(require_auth: bool = False, referer: str = BASE_URL) -> httpx.Cli
     cookies = load_cookies()
 
     if require_auth and not has_login_session(cookies):
-        raise ValueError(
-            "No AliExpress session found. Open aliexpress.com in Chrome, "
-            "log in, and click 'Save AliExpress' in the MCP Auth Bridge extension."
-        )
+        raise ValueError(f"No AliExpress session found. {SESSION_HINT}")
 
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items()) if cookies else ""
 
@@ -135,10 +222,13 @@ def check_auth_redirect(response: httpx.Response) -> bool:
     return "login.aliexpress" in url or "/login.htm" in url or "passport" in url
 
 
-AUTH_EXPIRED_MSG = (
-    "AliExpress session expired or missing. Open aliexpress.com in Chrome, "
-    "log in, and click 'Save AliExpress' in the MCP Auth Bridge extension."
+# How to get a fresh session, for the configured cookie source.
+SESSION_HINT = (
+    "Open aliexpress.com in Firefox (log in if needed), then retry."
+    if FIREFOX_PROFILE
+    else "Open aliexpress.com in Chrome, log in, and click 'Save AliExpress' in the MCP Auth Bridge extension."
 )
+AUTH_EXPIRED_MSG = f"AliExpress session expired or missing. {SESSION_HINT}"
 
 
 # ─── MTOP API Client ────────────────────────────────────────────────────────
@@ -857,8 +947,12 @@ def search_products(
 
 MTOP_BLOCKED_MSG = (
     "AliExpress's anti-bot check (captcha) blocked the product API. Search still "
-    "works. For details and shipping, save a browser session with the MCP Auth "
-    "Bridge extension (real browser cookies usually pass) or retry later."
+    "works. For details and shipping, real browser cookies usually pass: "
+    + (
+        "open the product page in Firefox, solve the captcha if one appears, then retry."
+        if FIREFOX_PROFILE
+        else "save a browser session with the MCP Auth Bridge extension, or retry later."
+    )
 )
 
 
@@ -1547,7 +1641,7 @@ def view_cart() -> str:
 
     Calls the signed MTOP endpoint `mtop.aliexpress.trade.cart.render` v1.0.
     Requires a fresh session — if you see an empty cart despite having items,
-    re-save AliExpress cookies via the MCP Auth Bridge extension.
+    refresh the browser session (see the returned hint).
     """
     cookies = load_cookies()
     if not has_login_session(cookies):
@@ -1569,7 +1663,7 @@ def view_cart() -> str:
     if not any("SUCCESS" in r for r in ret):
         return (
             f"Cart API returned: {ret_str}. "
-            "If this says TOKEN_EXPIRED, re-save AliExpress cookies via the MCP Auth Bridge."
+            f"If this says TOKEN_EXPIRED: {SESSION_HINT}"
         )
 
     cart = _extract_cart(resp)
@@ -1580,8 +1674,7 @@ def view_cart() -> str:
         if count == 0:
             return (
                 "Your AliExpress cart is empty (server count: 0). "
-                "If you just added items, re-save AliExpress cookies via the "
-                "MCP Auth Bridge extension to refresh the session, then retry."
+                f"If you just added items, refresh the session. {SESSION_HINT}"
             )
         return (
             f"Cart render succeeded but no item blocks matched. Server count: {count}. "

@@ -204,6 +204,55 @@ def test_variants_rendered(monkeypatch):
     out = m.get_product_details(item_id="1", variant="GREY 1m")
     assert "1 available of 1 matching" in out and "0.5m" not in out
 
+# ─── Firefox cookie source ──────────────────────────────────────────────────
+
+import sqlite3, time
+
+def _ff_profile(tmp_path, rows):
+    prof = tmp_path / "abcd.default-release"
+    prof.mkdir()
+    con = sqlite3.connect(prof / "cookies.sqlite")
+    con.execute("CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, originAttributes TEXT NOT NULL DEFAULT '', "
+                "name TEXT, value TEXT, host TEXT, path TEXT, expiry INTEGER)")
+    con.executemany("INSERT INTO moz_cookies (originAttributes, name, value, host, path, expiry) VALUES (?,?,?,?,'/',?)", rows)
+    con.commit(); con.close()
+    return prof
+
+def test_find_firefox_profile_prefers_install_default(tmp_path, monkeypatch):
+    (tmp_path / "profiles.ini").write_text(
+        "[Install4F96D1932A9F858E]\nDefault=abcd.default-release\nLocked=1\n\n"
+        "[Profile1]\nName=default\nIsRelative=1\nPath=old.default\nDefault=1\n\n"
+        "[Profile0]\nName=default-release\nIsRelative=1\nPath=abcd.default-release\n")
+    monkeypatch.setattr(m, "FIREFOX_DIRS", [tmp_path / "missing", tmp_path])
+    assert m.find_firefox_profile("auto") == tmp_path / "abcd.default-release"
+    assert m.find_firefox_profile("~/x") == m.Path("~/x").expanduser()
+
+def test_find_firefox_profile_legacy_default(tmp_path, monkeypatch):
+    (tmp_path / "profiles.ini").write_text("[Profile0]\nName=default\nIsRelative=1\nPath=old.default\nDefault=1\n")
+    monkeypatch.setattr(m, "FIREFOX_DIRS", [tmp_path])
+    assert m.find_firefox_profile("auto") == tmp_path / "old.default"
+
+def test_load_firefox_cookies(tmp_path):
+    future_ms, past_ms = int(time.time() * 1000) + 10**9, int(time.time() * 1000) - 10**6
+    prof = _ff_profile(tmp_path, [
+        ("", "xman_t", "domain", ".aliexpress.com", future_ms),
+        ("", "xman_t", "hostonly", "www.aliexpress.com", future_ms),  # host-only wins
+        ("", "_m_h5_tk", "tok_1", ".aliexpress.com", future_ms // 1000),  # expiry in seconds
+        ("", "stale", "x", ".aliexpress.com", past_ms),
+        ("", "other_site", "x", "it.aliexpress.com", future_ms),  # not sent to www/acs
+        ("^userContextId=2", "container", "x", ".aliexpress.com", future_ms),
+        ("", "foreign", "x", ".example.com", future_ms),
+    ])
+    assert m.load_firefox_cookies(prof) == {"xman_t": "hostonly", "_m_h5_tk": "tok_1"}
+
+def test_load_cookies_from_firefox(tmp_path, monkeypatch):
+    prof = _ff_profile(tmp_path, [("", "xman_us_t", "x", ".aliexpress.com", 0),
+                                  ("", "aep_usuc_f", "region=US", ".aliexpress.com", 0)])
+    monkeypatch.setattr(m, "FIREFOX_PROFILE", str(prof))
+    monkeypatch.setattr(m, "CREDENTIALS_PATH", tmp_path / "ignored.json")
+    c = m.load_cookies()
+    assert m.has_login_session(c) and "region=IL" in c["aep_usuc_f"]
+
 def test_free_shipping_flag():
     resp = {"data": {"result": {"PRODUCT_TITLE": {"text": "x"}, "SHIPPING": {"originalLayoutResultList": [
         {"bizData": {"shippingFee": "free", "discount": 100.0, "shipFrom": "Germany",

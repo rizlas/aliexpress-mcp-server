@@ -18,7 +18,7 @@ It is read-only by design. It does **not** add to cart, check out, or pay.
 | `search_products(query, min_rating, max_price, sort_by)` | No | Search AliExpress. Sort by `best_match`, `orders`, `price_asc` or `price_desc`, and filter by rating or price. Prices are for the cheapest variant. |
 | `get_product_details(item_id or url, variant)` | No, but see [Known limitations](#known-limitations) | Title, price and discount, rating, sold count, seller, shipping cost and delivery estimate, plus every variant (color, size, etc.) with its own price, cheapest first. `variant` filters the variants by name, e.g. `"black 2m"`. |
 | `get_shipping_estimate(item_id)` | No, but see [Known limitations](#known-limitations) | Shipping cost and delivery estimate to your country. |
-| `view_cart()` | **Yes** | What's in your AliExpress cart. Needs the Chrome extension ([Cart access](#cart-access-optional-chrome-extension)). |
+| `view_cart()` | **Yes** | What's in your AliExpress cart. Needs a browser session: [Firefox](#session-from-firefox-recommended-on-linux) or the [Chrome extension](#cart-access-optional-chrome-extension). |
 
 Example prompts:
 
@@ -80,7 +80,40 @@ Then quit and reopen Claude Desktop. On Windows the Python path is `.venv\Script
 claude mcp add aliexpress --scope user -- /path/to/aliexpress-mcp-server/.venv/bin/python /path/to/aliexpress-mcp-server/aliexpress_mcp_server.py
 ```
 
-Search, product details and shipping work now. Only follow the next section if you want cart access.
+Search works now. Product details and shipping usually do too, but without a browser
+session they may hit a captcha ([Known limitations](#known-limitations)). For those and
+for cart access, set up a session from Firefox or with the Chrome extension, as
+described below.
+
+## Session from Firefox (recommended on Linux)
+
+If you use Firefox, the server can read your AliExpress session straight from your
+Firefox profile, with no extension to install. Add `ALIEXPRESS_FIREFOX_PROFILE=auto` to
+the server's environment, e.g. in Claude Code:
+
+```bash
+claude mcp add aliexpress -e ALIEXPRESS_FIREFOX_PROFILE=auto --scope user -- /path/to/aliexpress-mcp-server/.venv/bin/python /path/to/aliexpress-mcp-server/aliexpress_mcp_server.py
+```
+
+`auto` picks the profile your installed Firefox opens (the `[Install…]` entry of
+`profiles.ini`), looking in the deb/tarball, snap and flatpak locations on Linux and in
+`~/Library/Application Support/Firefox` on macOS. You can also pass a profile directory,
+e.g. `~/.mozilla/firefox/abcd1234.default-release`.
+
+Then log in to aliexpress.com in Firefox. The cookies are read on every call, so the
+server always uses the session your browser has: there is nothing to re-save when it
+rotates. If the product tools report a captcha, open the product page in Firefox, solve
+it, and retry.
+
+Firefox keeps `cookies.sqlite` locked while it runs, so the server copies it (with its
+`-wal` file) into a private temporary directory, reads only the `aliexpress.com` cookies
+of the default container, and deletes the copy right away. Logins made inside a
+Multi-Account Container are not seen. When this variable is set,
+`ALIEXPRESS_CREDENTIALS` is ignored.
+
+> **Privacy.** The server reads your logged-in AliExpress session from your Firefox
+> profile on every call. It sends those cookies only to aliexpress.com and doesn't keep
+> a copy.
 
 ## Cart access (optional): Chrome extension
 
@@ -135,7 +168,8 @@ All settings are optional environment variables. In Claude Desktop, add them und
 | `ALIEXPRESS_COUNTRY` | `IT` | Ship-to country, as a two-letter code (`US`, `GB`, `DE`, `CA`, …). |
 | `ALIEXPRESS_CURRENCY` | `EUR` | Display currency (`USD`, `GBP`, `ILS`, …). |
 | `ALIEXPRESS_LOCALE` | `it_IT` | Language of titles and text (`en_US` for the original English titles). |
-| `ALIEXPRESS_CREDENTIALS` | `~/.mcp-credentials/aliexpress.json` | Where the Chrome extension's session file is. |
+| `ALIEXPRESS_FIREFOX_PROFILE` | unset | Read the session from Firefox: `auto` or a profile directory ([Session from Firefox](#session-from-firefox-recommended-on-linux)). |
+| `ALIEXPRESS_CREDENTIALS` | `~/.mcp-credentials/aliexpress.json` | Where the Chrome extension's session file is. Ignored when `ALIEXPRESS_FIREFOX_PROFILE` is set. |
 
 For example, to ship to Germany with prices in euros:
 
@@ -171,8 +205,8 @@ Search still uses the simpler HTML path — no signed calls needed. `window.runP
 - **Captcha on product details and shipping.** Without browser cookies, depending on
   your IP, the MTOP API may answer with an anti-bot captcha (`FAIL_SYS_USER_VALIDATE` /
   `RGV587_ERROR`) instead of product data. Search is not affected. The tools say so
-  explicitly; saving a session with the MCP Auth Bridge extension ([Save your
-  session](#save-your-session)) usually fixes it.
+  explicitly; a browser session ([Firefox](#session-from-firefox-recommended-on-linux)
+  or [Chrome extension](#save-your-session)) usually fixes it.
 - **Low-volume / brand-new listings** sometimes return empty MTOP responses (endpoint returns `SUCCESS` but an empty data block). Likely a region/visibility gate. Search results still show the listing fine.
 - **Cookies expire / lag the cart.** When tool calls start returning "session expired" — or `view_cart` reports an empty cart despite having items — re-open aliexpress.com in Chrome and click **Save AliExpress** again to capture fresh session cookies. The `_m_h5_tk` token and cart state rotate together; stale cookies show an empty server-side cart.
 - **Rate limiting** is the user's responsibility. The server sends realistic Chrome headers but doesn't throttle; don't hammer the search.
